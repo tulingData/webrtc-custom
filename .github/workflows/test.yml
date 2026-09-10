@@ -1,18 +1,28 @@
-name: Test Actions
+name: Build WebRTC Android
 
 on:
   workflow_dispatch:
 
 jobs:
-  test:
+  build:
     runs-on: ubuntu-latest
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v4
 
-      - name: Test
+      - name: Show system info
         run: |
-          echo "GitHub Actions is working"
+          echo "Preparing WebRTC build"
           uname -a
           df -h
+
+      - name: Checkout WebRTC build scripts
+        run: |
+          git clone --branch m144.7559.14 --depth 1 \
+            https://github.com/webrtc-sdk/webrtc-build.git webrtc-build
+
+      - name: Check build scripts
+        run: |
+          ls -la webrtc-build
+          ls -la webrtc-build/build
