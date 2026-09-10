@@ -1,4 +1,4 @@
-name: Build WebRTC Android
+name: Build WebRTC M144 ARM32
 
 on:
   workflow_dispatch:
@@ -6,23 +6,202 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 180
 
     steps:
+      # ----------------------------------------
+      # 1. Checkout 当前自己的仓库
+      # ----------------------------------------
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
-      - name: Show system info
+      # ----------------------------------------
+      # 2. 清理 GitHub Runner 磁盘
+      # WebRTC 源码 + Docker 编译非常占空间
+      # ----------------------------------------
+      - name: Free disk space
+        shell: bash
         run: |
-          echo "Preparing WebRTC build"
-          uname -a
+          echo "========== Disk before cleanup =========="
           df -h
 
-      - name: Checkout WebRTC build scripts
-        run: |
-          git clone --branch m144.7559.14 --depth 1 \
-            https://github.com/webrtc-sdk/webrtc-build.git webrtc-build
+          sudo rm -rf /usr/share/dotnet || true
+          sudo rm -rf /opt/ghc || true
+          sudo rm -rf /usr/local/.ghcup || true
+          sudo rm -rf /usr/local/lib/android || true
+          sudo rm -rf /opt/hostedtoolcache/CodeQL || true
+          sudo rm -rf /usr/local/share/boost || true
 
-      - name: Check build scripts
+          sudo apt-get clean
+
+          echo "========== Disk after cleanup =========="
+          df -h
+
+      # ----------------------------------------
+      # 3. 下载与 144.7559.14 对应的构建脚本
+      # ----------------------------------------
+      - name: Clone WebRTC build scripts
+        shell: bash
         run: |
-          ls -la webrtc-build
-          ls -la webrtc-build/build
+          git clone \
+            --branch m144.7559.14 \
+            --depth 1 \
+            https://github.com/webrtc-sdk/webrtc-build.git \
+            webrtc-build
+
+          echo "========== WebRTC Version =========="
+          cat webrtc-build/build/VERSION
+
+      # ----------------------------------------
+      # 4. 把官方默认四架构改成只编 ARM32
+      #
+      # 原来：
+      # ['armeabi-v7a', 'arm64-v8a', 'x86_64', 'x86']
+      #
+      # 改成：
+      # ['armeabi-v7a']
+      # ----------------------------------------
+      - name: Set ARM32 only
+        shell: bash
+        run: |
+          python3 <<'PY'
+          from pathlib import Path
+
+          p = Path("webrtc-build/build/run.py")
+          text = p.read_text()
+
+          old = "ANDROID_ARCHS = ['armeabi-v7a', 'arm64-v8a', 'x86_64', 'x86']"
+          new = "ANDROID_ARCHS = ['armeabi-v7a']"
+
+          if old not in text:
+              raise SystemExit(
+                  "ERROR: Cannot find ANDROID_ARCHS in run.py"
+              )
+
+          text = text.replace(old, new, 1)
+          p.write_text(text)
+
+          print("Changed:")
+          print(new)
+          PY
+
+          echo "========== Verify architecture =========="
+          grep "ANDROID_ARCHS =" webrtc-build/build/run.py
+
+      # ----------------------------------------
+      # 5. 真正编译 WebRTC
+      #
+      # 官方 build.android.sh 会通过 Docker：
+      # - 拉 WebRTC 源码
+      # - checkout M144 对应 commit
+      # - gclient sync
+      # - 编译
+      # - 生成 AAR
+      # ----------------------------------------
+      - name: Build WebRTC ARM32
+        shell: bash
+        run: |
+          cd webrtc-build/build
+
+          chmod +x build.android.sh
+
+          ./build.android.sh
+
+      # ----------------------------------------
+      # 6. 查看官方生成的包
+      # ----------------------------------------
+      - name: Show package
+        shell: bash
+        run: |
+          echo "========== Build package =========="
+
+          ls -lh \
+            webrtc-build/build/_package/android/
+
+          echo "========== Disk =========="
+          df -h
+
+      # ----------------------------------------
+      # 7. 从官方 webrtc.tar.gz 里提取 libwebrtc.aar
+      # ----------------------------------------
+      - name: Extract AAR
+        shell: bash
+        run: |
+          mkdir -p extracted
+          mkdir -p dist
+
+          PACKAGE="webrtc-build/build/_package/android/webrtc.tar.gz"
+
+          if [ ! -f "$PACKAGE" ]; then
+            echo "ERROR: webrtc.tar.gz not found"
+            exit 1
+          fi
+
+          echo "========== TAR content =========="
+          tar -tzf "$PACKAGE" | head -100
+
+          tar -xzf "$PACKAGE" -C extracted
+
+          AAR_PATH=$(find extracted \
+            -type f \
+            -name "libwebrtc.aar" \
+            | head -n 1)
+
+          if [ -z "$AAR_PATH" ]; then
+            echo "ERROR: libwebrtc.aar not found"
+            find extracted -type f | head -200
+            exit 1
+          fi
+
+          echo "Found AAR:"
+          echo "$AAR_PATH"
+
+          cp "$AAR_PATH" \
+            dist/libwebrtc-m144.7559.14-armeabi-v7a.aar
+
+          ls -lh dist/
+
+      # ----------------------------------------
+      # 8. 验证 AAR 里面真的只有 armeabi-v7a
+      # ----------------------------------------
+      - name: Verify AAR ABI
+        shell: bash
+        run: |
+          AAR="dist/libwebrtc-m144.7559.14-armeabi-v7a.aar"
+
+          echo "========== Native libraries =========="
+
+          unzip -l "$AAR" \
+            | grep -E "jni/|libjingle_peerconnection_so.so" \
+            || true
+
+          echo
+          echo "========== ABI list =========="
+
+          ABIS=$(unzip -Z1 "$AAR" \
+            | sed -n 's#^jni/\([^/]*\)/.*#\1#p' \
+            | sort -u)
+
+          echo "$ABIS"
+
+          if [ "$ABIS" != "armeabi-v7a" ]; then
+            echo "ERROR: Unexpected ABI found!"
+            echo "Expected: armeabi-v7a"
+            echo "Actual:"
+            echo "$ABIS"
+            exit 1
+          fi
+
+          echo
+          echo "SUCCESS: AAR contains ARM32 only."
+
+      # ----------------------------------------
+      # 9. 上传 AAR 到 GitHub Actions Artifacts
+      # ----------------------------------------
+      - name: Upload AAR
+        uses: actions/upload-artifact@v4
+        with:
+          name: webrtc-m144.7559.14-arm32
+          path: dist/libwebrtc-m144.7559.14-armeabi-v7a.aar
+          if-no-files-found: error
+          retention-days: 7
